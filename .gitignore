@@ -3,3 +3,5 @@ venv
 *.pdf
 *.csv
 .env
+*.txt
+garage.toml

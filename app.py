@@ -1,10 +1,11 @@
-from flask import Flask
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import chromadb
 import os
 import uuid
 from chromadb.config import Settings
 import pandas as pd
+import requests
 
 load_dotenv()
 app = Flask(__name__)
@@ -37,6 +38,10 @@ from ragas.metrics import (
 )
 from ragas import evaluate
 import ast
+
+from filestorage import getPresignedUrls
+from minio.commonconfig import Tags
+from filestorage import setMetaTags
 
 # volname:/chroma/chroma => for volume mounting while running the container
 # -e ALLOW_RESET=true => for allowing reset of the database
@@ -199,5 +204,36 @@ def evaluateTestCases(testcasefile):
 def init():
     return 'Init'
 
-# if __name__ == '__main__':
-#     app.run() 
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    
+    file = request.files['file']
+    if file:
+
+        url = getPresignedUrls(file.filename)
+        print(url)
+        response = requests.put(url, data=file)
+        # tags = Tags.new_object_tags()
+        # tags["uid"] = "123"
+        # tags["pid"] = "456"
+        
+        # setMetaTags(file.filename, tags)
+        
+        if response.status_code == 200:
+            print(response)
+            return jsonify({'done': 'Uploaded'}), 200
+        else:
+            return jsonify({'error': 'Upload failed'}), 500
+    return jsonify({'error': 'No file uploaded'}), 400
+
+from filestorage import getAllFiles
+from filestorage import getPresignedGetUrls
+
+# @app.route('/files', methods=['GET'])
+# def get_files():
+#     files = getAllFiles()
+#     file_urls = [getPresignedGetUrls(file.object_name) for file in files]
+#     return jsonify(file_urls), 200
+
+if __name__ == '__main__':
+    app.run(debug=True)
