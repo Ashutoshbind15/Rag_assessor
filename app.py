@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 import chromadb
 import os
 import uuid
-from chromadb.config import Settings
 import pandas as pd
 import requests
 from flask_sqlalchemy import SQLAlchemy
@@ -12,7 +11,6 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import datetime
 import uuid
 from sqlalchemy import inspect
-import tempfile
 
 load_dotenv(override=True)
 app = Flask(__name__)
