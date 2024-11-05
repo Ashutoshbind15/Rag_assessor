@@ -6,9 +6,64 @@ import uuid
 from chromadb.config import Settings
 import pandas as pd
 import requests
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+import datetime
+import uuid
+from sqlalchemy import inspect
+import tempfile
 
-load_dotenv()
+load_dotenv(override=True)
 app = Flask(__name__)
+
+print(os.getenv("RANDOM"))
+
+app.config['SECRET_KEY'] = 'your-secret-key'  # Change this to a secure secret key
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:postgres@localhost:5432/pdfspace'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+login_manager = LoginManager()
+login_manager.init_app(app)
+ 
+# Database Models
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    spaces = db.relationship('Space', backref='owner', lazy=True)
+    uploaded_pdfs = db.relationship('PDF', backref='uploader', lazy=True)
+
+class Space(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    pdfs = db.relationship('PDF', secondary='space_pdf', backref='spaces')
+
+class PDF(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    object_id = db.Column(db.String(100), unique=True, nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    uploaded_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+# Association tables
+space_pdf = db.Table('space_pdf',
+    db.Column('space_id', db.Integer, db.ForeignKey('space.id'), primary_key=True),
+    db.Column('pdf_id', db.Integer, db.ForeignKey('pdf.id'), primary_key=True)
+)
+
+space_user = db.Table('space_user',
+    db.Column('space_id', db.Integer, db.ForeignKey('space.id'), primary_key=True),
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True)
+)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
 
 # chroma_client = chromadb.HttpClient(host='localhost', port=8000, settings=Settings(allow_reset=True))
 chroma_client = chromadb.HttpClient(host='localhost', port=8000)
@@ -81,7 +136,7 @@ def retreive(query):
     return results
 
 PROMPT_TEMPLATE = """
-Answer the question based on the following context, and refuse to answer if the question is out of scope, answer like -> I can't answer that question as it seems out of scope.
+Answer the question based on the following context
 {context}
  - -
 Answer the question based on the above context, dont start the answer with something like -> Acc to the ctx, ... <- , use the context: {question}
@@ -92,6 +147,8 @@ def queryLLM(ctx, query_text):
 
     prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
     prompt = prompt_template.format(context=context_text, question=query_text)
+    
+    print(prompt)
     
     model = ChatOpenAI()
     res = model.predict(prompt)
@@ -111,6 +168,7 @@ def gemerateEvalTestCases(doc):
 
 def answerQuery(query):
     qctxts = retreive(query=query)
+    # print(qctxts)
     res = queryLLM(qctxts, query_text=query)
     return res
 
@@ -193,7 +251,7 @@ def evaluateTestCases(testcasefile):
 # qctxts = retreive("How do i secure the atm?")
 # print(qctxts)
 
-# res = queryLLM(qctxts, "How do i secure the atm?")
+# res = answerQuery("How do the security features and usability enhancements in ATM systems compare across different reports, considering aspects like user-centered design, biometrics for security, and interface design improvements?")
 # print(res)
 
 # gemerateEvalTestCases('./hci.pdf')
@@ -204,27 +262,60 @@ def evaluateTestCases(testcasefile):
 def init():
     return 'Init'
 
+@app.route('/getuserfiles', methods=['GET'])
+@login_required
+def get_user_files():
+    user_files = PDF.query.filter_by(uploaded_by=current_user.id).all()
+    file_urls = [getPresignedGetUrls(file.object_id) for file in user_files]
+    return jsonify(file_urls), 200
+
 @app.route('/upload', methods=['POST'])
+@login_required
+
 def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
     
     file = request.files['file']
-    if file:
+    space_id = request.form.get('space_id')
+    
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
 
-        url = getPresignedUrls(file.filename)
+    if file and allowed_file(file.filename):
+        # Your existing file upload logic here
+        object_id = str(uuid.uuid4())  # Generate unique object ID
+        
+        url = getPresignedUrls(object_id)
         print(url)
         response = requests.put(url, data=file)
-        # tags = Tags.new_object_tags()
-        # tags["uid"] = "123"
-        # tags["pid"] = "456"
-        
-        # setMetaTags(file.filename, tags)
-        
-        if response.status_code == 200:
-            print(response)
-            return jsonify({'done': 'Uploaded'}), 200
-        else:
-            return jsonify({'error': 'Upload failed'}), 500
-    return jsonify({'error': 'No file uploaded'}), 400
+
+        print(response.status_code) 
+
+        # if response.status_code != 200:
+            # return jsonify({'error': 'Failed to upload file'}), 500
+
+        # Create PDF record
+        pdf = PDF(
+            object_id=object_id,
+            filename=file.filename,
+            uploaded_by=current_user.id
+        )
+        db.session.add(pdf)
+
+        # If space_id is provided, add PDF to space
+        if space_id:
+            space = Space.query.get(space_id)
+            if space and (space.created_by == current_user.id or current_user.id in [u.id for u in space.users]):
+                space.pdfs.append(pdf)
+
+        db.session.commit()
+        return jsonify({
+            'message': 'File uploaded successfully',
+            'object_id': object_id
+        }), 200
+
+    return jsonify({'error': 'File type not allowed'}), 400
 
 from filestorage import getAllFiles
 from filestorage import getPresignedGetUrls
@@ -235,5 +326,102 @@ from filestorage import getPresignedGetUrls
 #     file_urls = [getPresignedGetUrls(file.object_name) for file in files]
 #     return jsonify(file_urls), 200
 
+# Authentication routes
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    if User.query.filter_by(email=data['email']).first():
+        return jsonify({'error': 'Email already registered'}), 400
+    
+    user = User(
+        email=data['email'],
+        password_hash=generate_password_hash(data['password'])
+    )
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({'message': 'User registered successfully'}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    user = User.query.filter_by(email=data['email']).first()
+    if user and check_password_hash(user.password_hash, data['password']):
+        login_user(user)
+        return jsonify({'message': 'Logged in successfully'})
+    return jsonify({'error': 'Invalid credentials'}), 401
+
+# Space management endpoints
+@app.route('/spaces', methods=['POST'])
+@login_required
+def create_space():
+    data = request.json
+    space = Space(
+        name=data['name'],
+        created_by=current_user.id
+    )
+    db.session.add(space)
+    db.session.commit()
+    return jsonify({'message': 'Space created successfully', 'space_id': space.id}), 201
+
+@app.route('/spaces/<int:space_id>/share', methods=['POST'])
+@login_required
+def share_space(space_id):
+    space = Space.query.get_or_404(space_id)
+    if space.created_by != current_user.id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    data = request.json
+    user = User.query.filter_by(email=data['email']).first()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    statement = space_user.insert().values(space_id=space_id, user_id=user.id)
+    db.session.execute(statement)
+    db.session.commit()
+    return jsonify({'message': 'Space shared successfully'}), 200
+
+# Add this function to check allowed file types
+def allowed_file(filename):
+    ALLOWED_EXTENSIONS = {'pdf', 'doc', 'docx'}  # Add your allowed extensions here
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# Create a directory for temporary files if it doesn't exist
+TEMP_DIR = 'tempfiles'
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+@app.route('/index_upload', methods=['POST'])
+@login_required
+def index_and_upload():
+    user_files = PDF.query.filter_by(uploaded_by=current_user.id).all()
+    for file in user_files:
+        presigned_url = getPresignedGetUrls(file.object_id)
+        
+        # Download the file
+        response = requests.get(presigned_url)
+        if response.status_code == 200:
+            temp_file_path = os.path.join(TEMP_DIR, file.filename)
+            with open(temp_file_path, 'wb') as temp_file:
+                temp_file.write(response.content)
+                
+                docs = docLoad(temp_file_path) 
+                splits = textSplitter(docs)
+                print(splits)
+                embedAndStore(splits) 
+        else:
+            return jsonify({'error': f'Failed to download file {file.filename}'}), 500
+
+    return jsonify({'message': 'All user files indexed and uploaded successfully'}), 200
+
 if __name__ == '__main__':
+    with app.app_context():
+        print("Checking for existing database tables...")
+        inspector = inspect(db.engine)
+        
+        # Check if the User table exists
+        if not inspector.has_table('user'):
+            print("Creating database tables...")
+            db.create_all()  # Create tables if they do not exist
+            print("Database tables created.")
+        else:
+            print("Database tables already exist.")
     app.run(debug=True)

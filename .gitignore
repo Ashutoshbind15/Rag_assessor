@@ -5,3 +5,4 @@ venv
 .env
 *.txt
 garage.toml
+tempfiles

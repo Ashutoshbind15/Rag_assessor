@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
     garage:
         container_name: garage
@@ -10,6 +12,33 @@ services:
             - ./garage.toml:/etc/garage.toml
             - garage-meta:/var/lib/garage/meta:rw
             - garage-data:/var/lib/garage/data:rw
+
+    chromadb:
+        container_name: chromadb
+        image: chromadb/chroma
+        ports:
+            - "8000:8000"
+        volumes:
+            - cr1:/chroma/chroma
+
+    db:
+        container_name: aggrdb
+        image: postgres:14
+        environment:
+            - POSTGRES_USER=postgres
+            - POSTGRES_PASSWORD=postgres
+            - POSTGRES_DB=pdfspace
+        ports:
+            - "5432:5432"
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+
 volumes:
     garage-data:
+      name: garage-data
     garage-meta:
+      name: garage-meta
+    cr1:
+      name: cr1
+    postgres_data:
+      name: postgres_data

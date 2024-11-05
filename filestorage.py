@@ -10,12 +10,12 @@ client = Minio(
     secure=False,  # Set to True if using HTTPS
     region=os.getenv('BUCKET_REGION')
 )
-
+ 
 # Example of checking if the client can access a bucket
 # uploadBucket = client.make_bucket("uploads")
-# buckets = client.list_buckets()
+buckets = client.list_buckets()
 
-# print("Buckets:", buckets)
+print("Buckets:", buckets)
 
 # for bucket in buckets:
 #     print(bucket.name)
