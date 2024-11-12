@@ -31,7 +31,14 @@ services:
         ports:
             - "5432:5432"
         volumes:
-            - postgres_data:/var/lib/postgresql/data
+            - postgres_data1:/var/lib/postgresql/data
+    
+    rmq:
+        container_name: rmq
+        image: rabbitmq:3.12.1-management
+        ports:
+            - "5672:5672"
+            - "15672:15672"
 
 volumes:
     garage-data:
@@ -40,5 +47,5 @@ volumes:
       name: garage-meta
     cr1:
       name: cr1
-    postgres_data:
-      name: postgres_data
+    postgres_data1:
+      name: postgres_data1

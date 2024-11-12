@@ -6,11 +6,14 @@ import uuid
 import pandas as pd
 import requests
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, login_required, current_user
+from flask_login import LoginManager, UserMixin, login_user, login_required, current_user, logout_user
 from werkzeug.security import generate_password_hash, check_password_hash
 import datetime
 import uuid
 from sqlalchemy import inspect
+from libs.auth import login_init, login_manager
+from flask_cors import CORS, cross_origin
+from functools import wraps
 
 load_dotenv(override=True)
 app = Flask(__name__)
@@ -22,15 +25,17 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:postgres@localhos
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
-login_manager = LoginManager()
-login_manager.init_app(app)
- 
+login_init(app)
+CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins
+
+# todo: add migrations
+
 # Database Models
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
-    spaces = db.relationship('Space', backref='owner', lazy=True)
+    spaces_created = db.relationship('Space', backref='owner', lazy=True)
     uploaded_pdfs = db.relationship('PDF', backref='uploader', lazy=True)
 
 class Space(db.Model):
@@ -38,24 +43,42 @@ class Space(db.Model):
     name = db.Column(db.String(100), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    pdfs = db.relationship('PDF', secondary='space_pdf', backref='spaces')
-
+    iterations = db.relationship('Iteration', backref='space', lazy=True)
+    users = db.relationship('User', secondary='space_user', backref='spaces_shared')
+    
 class PDF(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     object_id = db.Column(db.String(100), unique=True, nullable=False)
     filename = db.Column(db.String(255), nullable=False)
     uploaded_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     uploaded_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    
+class Iteration(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    space_id = db.Column(db.Integer, db.ForeignKey('space.id'), nullable=False)
+    embedding_function = db.Column(db.String(255), nullable=False)
+    distance_function = db.Column(db.String(255), nullable=False)
+    vector_store = db.Column(db.String(255), nullable=False)
+    assessments = db.relationship('Assessment', backref='iteration', lazy=True)
+    files = db.relationship('PDF', secondary='iteration_pdf', backref='iterations')
+
+class Assessment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    iteration_id = db.Column(db.Integer, db.ForeignKey('iteration.id'), nullable=False)
+    testcasefile = db.Column(db.String(255), nullable=False)
+    resultsfile = db.Column(db.String(255), nullable=False)
+    # todo: add metrics
 
 # Association tables
-space_pdf = db.Table('space_pdf',
-    db.Column('space_id', db.Integer, db.ForeignKey('space.id'), primary_key=True),
-    db.Column('pdf_id', db.Integer, db.ForeignKey('pdf.id'), primary_key=True)
-)
 
 space_user = db.Table('space_user',
     db.Column('space_id', db.Integer, db.ForeignKey('space.id'), primary_key=True),
     db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True)
+)
+
+iteration_pdf = db.Table('iteration_pdf',
+    db.Column('iteration_id', db.Integer, db.ForeignKey('iteration.id'), primary_key=True),
+    db.Column('pdf_id', db.Integer, db.ForeignKey('pdf.id'), primary_key=True)
 )
 
 @login_manager.user_loader
@@ -260,15 +283,32 @@ def evaluateTestCases(testcasefile):
 def init():
     return 'Init'
 
+@app.route('/test', methods=['GET'])
+def test():
+    # test json response
+    return jsonify({'message': 'Test successful'}), 200
+
+def session_reqd(f):
+    @wraps(f)
+    @cross_origin(supports_credentials=True)
+    @login_required
+    def decorated_function(*args, **kwargs):
+        return f(*args, **kwargs)
+    return decorated_function
+
 @app.route('/getuserfiles', methods=['GET'])
-@login_required
+@session_reqd
 def get_user_files():
     user_files = PDF.query.filter_by(uploaded_by=current_user.id).all()
-    file_urls = [getPresignedGetUrls(file.object_id) for file in user_files]
-    return jsonify(file_urls), 200
+    
+    res = [{
+            'id': file.id,
+            'filename': file.filename
+        } for file in user_files]
+    return jsonify(res), 200
 
 @app.route('/upload', methods=['POST'])
-@login_required
+@session_reqd
 
 def upload_file():
     if 'file' not in request.files:
@@ -281,7 +321,6 @@ def upload_file():
         return jsonify({'error': 'No selected file'}), 400
 
     if file and allowed_file(file.filename):
-        # Your existing file upload logic here
         object_id = str(uuid.uuid4())  # Generate unique object ID
         
         url = getPresignedUrls(object_id)
@@ -302,10 +341,11 @@ def upload_file():
         db.session.add(pdf)
 
         # If space_id is provided, add PDF to space
+        # todo: allow upload for multiple file types
         if space_id:
             space = Space.query.get(space_id)
             if space and (space.created_by == current_user.id or current_user.id in [u.id for u in space.users]):
-                space.pdfs.append(pdf)
+                space.files.append(pdf)
 
         db.session.commit()
         return jsonify({
@@ -340,6 +380,7 @@ def register():
     return jsonify({'message': 'User registered successfully'}), 201
 
 @app.route('/login', methods=['POST'])
+@cross_origin(supports_credentials=True)
 def login():
     data = request.json
     user = User.query.filter_by(email=data['email']).first()
@@ -348,9 +389,31 @@ def login():
         return jsonify({'message': 'Logged in successfully'})
     return jsonify({'error': 'Invalid credentials'}), 401
 
+@app.route('/logout', methods=['POST'])
+@session_reqd
+def logout():
+    logout_user()
+    return jsonify({'message': 'Logged out successfully'}), 200
+
+@app.route('/profile', methods=['GET'])
+@session_reqd
+def profile():
+    user = User.query.get_or_404(current_user.id)
+    return jsonify({
+        'email': user.email,
+        'id': user.id 
+    }), 200
+    
+# todo: facilitate client side file upload from the urls
+# flow: 
+# 1. get presigned url for the file 
+# 2. upload the file to the url
+# 3. send the object id to the server
+# 4. some server side validation and then add to db, or call a webhook after adding to the filestore, if there's a util for that
+
 # Space management endpoints
 @app.route('/spaces', methods=['POST'])
-@login_required
+@session_reqd
 def create_space():
     data = request.json
     space = Space(
@@ -362,7 +425,7 @@ def create_space():
     return jsonify({'message': 'Space created successfully', 'space_id': space.id}), 201
 
 @app.route('/spaces/<int:space_id>/share', methods=['POST'])
-@login_required
+@session_reqd
 def share_space(space_id):
     space = Space.query.get_or_404(space_id)
     if space.created_by != current_user.id:
@@ -388,7 +451,7 @@ TEMP_DIR = 'tempfiles'
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 @app.route('/index_upload', methods=['POST'])
-@login_required
+@session_reqd
 def index_and_upload():
     user_files = PDF.query.filter_by(uploaded_by=current_user.id).all()
     for file in user_files:
@@ -410,8 +473,20 @@ def index_and_upload():
 
     return jsonify({'message': 'All user files indexed and uploaded successfully'}), 200
 
+# Custom error handler for unauthorized access
+@login_manager.unauthorized_handler
+def unauthorized():
+    return jsonify({'error': 'Unauthorized access'}), 401
+
+def drop_all_tables():
+    print("Dropping all database tables...")
+    db.drop_all()
+    print("All tables dropped successfully")
+
 if __name__ == '__main__':
     with app.app_context():
+        # drop_all_tables()
+        
         print("Checking for existing database tables...")
         inspector = inspect(db.engine)
         
