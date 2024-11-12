@@ -37,13 +37,15 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(256), nullable=False)
     spaces_created = db.relationship('Space', backref='owner', lazy=True)
     uploaded_pdfs = db.relationship('PDF', backref='uploader', lazy=True)
+    iterations = db.relationship('Iteration', backref='creator', lazy=True)
 
 class Space(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(255), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    iterations = db.relationship('Iteration', backref='space', lazy=True)
+    iterations = db.relationship('Iteration', secondary='space_iteration', backref='spaces', lazy=True)
     users = db.relationship('User', secondary='space_user', backref='spaces_shared')
     
 class PDF(db.Model):
@@ -55,12 +57,13 @@ class PDF(db.Model):
     
 class Iteration(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    space_id = db.Column(db.Integer, db.ForeignKey('space.id'), nullable=False)
     embedding_function = db.Column(db.String(255), nullable=False)
     distance_function = db.Column(db.String(255), nullable=False)
     vector_store = db.Column(db.String(255), nullable=False)
     assessments = db.relationship('Assessment', backref='iteration', lazy=True)
     files = db.relationship('PDF', secondary='iteration_pdf', backref='iterations')
+    collection_name = db.Column(db.String(255), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
 class Assessment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -79,6 +82,11 @@ space_user = db.Table('space_user',
 iteration_pdf = db.Table('iteration_pdf',
     db.Column('iteration_id', db.Integer, db.ForeignKey('iteration.id'), primary_key=True),
     db.Column('pdf_id', db.Integer, db.ForeignKey('pdf.id'), primary_key=True)
+)
+
+space_iteration = db.Table('space_iteration',
+    db.Column('space_id', db.Integer, db.ForeignKey('space.id'), primary_key=True),
+    db.Column('iteration_id', db.Integer, db.ForeignKey('iteration.id'), primary_key=True)
 )
 
 @login_manager.user_loader
@@ -315,7 +323,7 @@ def upload_file():
         return jsonify({'error': 'No file part'}), 400
     
     file = request.files['file']
-    space_id = request.form.get('space_id')
+    iteration_id = request.form.get('iteration_id')
     
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
@@ -342,10 +350,10 @@ def upload_file():
 
         # If space_id is provided, add PDF to space
         # todo: allow upload for multiple file types
-        if space_id:
-            space = Space.query.get(space_id)
-            if space and (space.created_by == current_user.id or current_user.id in [u.id for u in space.users]):
-                space.files.append(pdf)
+        if iteration_id:
+            iteration = Iteration.query.get(iteration_id)
+            if iteration:
+                iteration.files.append(pdf)
 
         db.session.commit()
         return jsonify({
@@ -411,6 +419,53 @@ def profile():
 # 3. send the object id to the server
 # 4. some server side validation and then add to db, or call a webhook after adding to the filestore, if there's a util for that
 
+# iteration management eps
+
+@app.route('/iterations', methods = ["POST"])
+@session_reqd
+def create_iteration():
+    data = request.json
+    
+    iteration = Iteration(
+        embedding_function=data['embedding_function'],
+        distance_function=data['distance_function'] if 'distance_function' in data else 'l2 squared norm',
+        vector_store=data['vector_store'] if 'vector_store' in data else 'chroma',
+        created_by=current_user.id
+    )
+    
+    collection = None
+    
+    if data['embedding_function'] == 'openai':
+        openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=os.getenv("OPENAI_API_KEY"),
+            model_name="text-embedding-3-small"
+        )
+        collection = chroma_client.create_collection(name=data['collection_name'], embedding_function=openai_ef)
+    
+    elif data['embedding_function'] == 'sentence-transformers':
+        ef = embedding_functions.DefaultEmbeddingFunction()
+        collection = chroma_client.create_collection(name=data['collection_name'], embedding_function=ef)
+    
+    else:
+        return jsonify({'error': 'Invalid embedding function'}), 400 
+    
+    iteration.collection_name = collection.name
+    db.session.add(iteration)
+    db.session.commit()
+    return jsonify({'message': 'Iteration created successfully', 'iteration_id': iteration.id}), 201
+
+@app.route('/iterations/<int:iteration_id>', methods=['GET'])
+@session_reqd
+def get_iteration(iteration_id):
+    iteration = Iteration.query.get_or_404(iteration_id)
+    return jsonify({'iteration': iteration}), 200
+
+@app.route('/iterations', methods=['GET'])
+@session_reqd
+def get_iterations():
+    iterations = Iteration.query.filter_by(created_by=current_user.id).all()
+    return jsonify({'iterations': iterations}), 200
+
 # Space management endpoints
 @app.route('/spaces', methods=['POST'])
 @session_reqd
@@ -432,12 +487,13 @@ def share_space(space_id):
         return jsonify({'error': 'Unauthorized'}), 403
     
     data = request.json
-    user = User.query.filter_by(email=data['email']).first()
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
+    emails = data['emails']
+    for email in emails:
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        space.users.append(user)
     
-    statement = space_user.insert().values(space_id=space_id, user_id=user.id)
-    db.session.execute(statement)
     db.session.commit()
     return jsonify({'message': 'Space shared successfully'}), 200
 
@@ -485,7 +541,7 @@ def drop_all_tables():
 
 if __name__ == '__main__':
     with app.app_context():
-        # drop_all_tables()
+        # drop_all_tables() 
         
         print("Checking for existing database tables...")
         inspector = inspect(db.engine)

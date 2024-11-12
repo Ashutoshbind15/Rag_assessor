@@ -31,7 +31,7 @@ services:
         ports:
             - "5432:5432"
         volumes:
-            - postgres_data1:/var/lib/postgresql/data
+            - postgres_data:/var/lib/postgresql/data
     
     rmq:
         container_name: rmq
@@ -47,5 +47,5 @@ volumes:
       name: garage-meta
     cr1:
       name: cr1
-    postgres_data1:
-      name: postgres_data1
+    postgres_data:
+      name: postgres_data
